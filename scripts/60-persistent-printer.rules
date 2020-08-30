@@ -1,0 +1,2 @@
+ACTION=="add", KERNEL=="lp*", SUBSYSTEMS=="usb", ATTRS{product}=="Canon CAPT USB Device", SYMLINK+="lp/canon_printer", RUN+="/usr/local/bin/attach_printer"
+ACTION=="remove", KERNEL=="lp*", SUBSYSTEMS=="usb", ATTRS{product}=="Canon CAPT USB Device", RUN+="/usr/local/bin/detach_printer"

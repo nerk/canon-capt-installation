@@ -1,0 +1,438 @@
+= Canon CAPT Printers on Ubuntu 16.04+ (64-bit)
+:experimental: true
+
+NOTE: This is mainly a reference for myself, but others might also find it useful. The method I described here
+should work, but I made no attempt to make the process completely generic. You have been warned.
+
+== The Problem
+
+I own an old Canon laser printer (LBP-2900), which is still going strong.
+Unfortunately, the printer uses the proprietary CAPT protocol and Canon drivers
+for Linux do no longer work with recent versions of CUPS.
+
+There are several attemps to make this printer work again, for example
+
+* https://github.com/agalakhov/captdriver.git
+* https://github.com/raducotescu/CanonCAPTdriver.git
+* https://github.com/hieplpvip/ubuntu_canon_printer.git
+
+and several other repositories for older Linux versions. 
+However, none of these methods worked for me on Ubuntu 20.04.
+
+I think, parts of the proprietary parts of the printer drivers are just to
+old to work with recent versions of CUPS.
+
+== The Solution: LXC
+
+The solution is to run a minimal compatible version of Ubuntu (14.04, 32-bit) inside a Linux container (LXC).
+
+The guest OS can directly use the kernel 
+of the host machine, but provides an isolated environment for the processes to be executed. 
+Compared to runninng a full virtualization solution like VMware or VirtualBox, this is much more 
+lightweight and quite fast.
+
+While full virtualization solutions are
+very powerful and feel a bit heavy, Docker with its 'one process per container' isn't 
+powerful enough for this task. LXC falls right in between the two.    
+
+
+== On the Host
+
+=== Prepare Host System
+
+On my host system, the device node created for my printer sometimes changed from `/dev/bus/usb/lp0` 
+to `/dev/bus/usb/lp1` on booting. It is also a good idea to 
+give it a more meaningful name anyway. This can be achieved by creating a symbolic link 
+to the actual device node. Create a the file `/etc/udev/rules.d/60-persistent-printer.rules` with 
+the following content:
+	
+./etc/udev/rules.d/60-persistent-printer.rules
+----
+ACTION=="add", KERNEL=="lp*", SUBSYSTEMS=="usb", ATTRS{product}=="Canon CAPT USB Device", SYMLINK+="lp/canon_printer", RUN+="/usr/local/bin/attach_printer"
+ACTION=="remove", KERNEL=="lp*", SUBSYSTEMS=="usb", ATTRS{product}=="Canon CAPT USB Device", RUN+="/usr/local/bin/detach_printer"
+----
+
+The printer can now be accessed through `/dev/lp/canon_printer` instead of 
+the generic device node (once the system has been rebooted).
+
+In case the printer is not already switched on before the server boots, the device will not be
+correctly propagated to the container. Having the udev rule executing the script `attach_printer` 
+in addition to creating the link solves this problem.
+
+Create file `/usr/local/bin/attach_printer` with the following contents:
+
+./usr/local/bin/attach_printer
+----
+#!/bin/bash
+
+/usr/bin/lxc-device -n canon add /dev/lp/canon_printer
+----
+
+Detaching the printer is handled through `/usr/local/bin/detach_printer`:
+
+./usr/local/bin/detach_printer
+----
+#!/bin/bash
+
+/usr/bin/lxc-device -n canon del /dev/lp/canon_printer
+----
+
+Make the scripts executable:
+
+----
+sudo chmod 755 /usr/local/bin/attach_printer
+sudo chmod 755 /usr/local/bin/detach_printer
+----
+
+ 
+=== Create a Network Bridge
+
+Since we want to be able to access the virtual print server from the LAN, we need to 
+bridge its network interface to the physical ethernet port of the server. 
+
+First, you need to figure out the name of your pysical interface. At some point, Ubuntu introduced 
+so called `predictable network interface names`, meaning that your first interface 
+is not simply called `eth0` anymore.
+
+Invoke
+
+----
+ifconfig
+----
+
+and look for an interface name starting with `e`, e.g. `eno1`.
+
+Open file `/etc/network/interfaces` in an editor and append the following:
+
+./etc/network/interfaces
+----
+auto br0
+iface br0 inet dhcp
+    bridge-ports eno1 <1>
+----
+<1> replace `eno1` with the name you found above!
+
+Make sure there is no other line with `auto eno1` in that file.
+
+Make all changes above effective by booting the system:
+
+----
+sudo reboot
+----
+
+IMPORTANT: Before continuing, make sure the printer is connected and switched on.
+
+You should now be able to access the printer through the 
+created link pointing to the real device node:
+
+----
+ls -l /dev/lp/canon_printer
+----
+
+=== Install LXC
+
+----
+sudo apt install lxc
+----
+
+=== Create LXC Container
+
+Create a virtual container named `canon` with a minimal 32-bit Ubuntu 14.04 (Trusty Thar):
+
+----
+sudo lxc-create -t download -n canon
+----
+
+Choose 'ubuntu', 'trusty', and 'i386'.
+
+=== Configure LXC Container
+
+----
+sudo vi /var/lib/lxc/canon/config
+----
+
+./var/lib/lxc/canon/config
+----
+
+
+# Network configuration
+lxc.network.type = veth
+lxc.network.link = br0 <1>
+lxc.network.flags = up
+lxc.network.hwaddr = 00:16:3e:3e:7b:94
+
+### Add the following:
+
+# Autostart
+lxc.start.auto = 1 <2>
+lxc.start.delay = 5
+
+# mount printer
+lxc.cgroup.devices.allow = c 180:* rwm <3>
+lxc.mount.entry = /dev/lp/canon_printer dev/lp/canon_printer none bind,optional,create=file <4>
+----
+<1> Change to `br0` from `lxcbr0`. Leave other entries in this block unchanged.
+<2> Autostart this container when the host boots
+<3> Allow access to printer devices on host
+<4> Initially mount the printer on the host to `/dev/lp/canon_printer` in the container.
+
+Start canon and verify it is running:
+
+----
+sudo lxc-start -n canon
+sudo lxc-ls --fancy
+----
+
+Since we need to be able to login to the print server,
+a user with appropriate settings must be created.
+
+Enter the `chroot` environment of `canon`:
+
+----
+sudo lxc-attach -n canon
+----
+
+Enable ssh:
+
+----
+apt-get install openssh-server
+----
+
+Create a user named `printer` and add it to the `lpadmin` group:
+
+----
+adduser printer
+----
+
+This user must be in `/etc/sudoers`. Add the line:
+
+./etc/sudoers
+----
+# User alias specification
+printer ALL=(ALL:ALL) ALL
+----
+
+Type `exit` to leave the environment.
+
+	
+=== CAPT Drivers 
+
+The CAPT driver version 2.70 can be downloaded from
+ 
+http://www.canon.co.uk/support/consumer_products/products/printers/laser/i-sensys_lbp2900.aspx
+ 
+
+For convenience, the correct packages can be found in the 'scripts' directory of this repository. 
+Please note the license of these files: link:drivers/LICENSE-EN.txt
+
+
+Copy the packages to the home directory of user 'printer' in the container.
+
+----
+sudo cp drivers/*.deb /var/lib/lxc/canon/rootfs/home/printer
+----
+
+== Install Drivers on Guest OS
+
+Login with ssh:
+
+----
+ssh printer@canon
+----
+
+The following configuration is done inside the running container.
+
+Update first:
+
+----
+sudo apt-get update 
+sudo apt-get upgrade
+----
+
+Most likely, the timezone of the container needs to be corrected.
+Invoke
+
+----
+sudo dpkg-reconfigure tzdata
+----
+
+and choose the proper settings.
+
+
+Now install CUPS and the CAPT printer.
+
+=== Install CUPS
+
+----
+sudo apt-get install cups cups-client cups-bsd
+----
+
+Add user `printer` to `lpadmin` group
+
+----
+sudo usermod -aG lpadmin printer
+----
+
+Enable access to the printer from other hosts in `/etc/cups/cupsd.conf` 
+
+./etc/cups/cupsd.conf
+----
+# Only listen for connections from the local machine.
+Listen localhost:631
+----
+
+to 
+
+./etc/cups/cupsd.conf
+----
+# Only listen for connections from the local machine.
+#Listen localhost:631
+Port 631
+----
+
+Share the printers and allow remote administration:
+
+----
+sudo cupsctl --share-printers 
+sudo cupsctl --remote-admin
+----
+
+WARNING: Since `cupsctl` did not work correctly with multiple parameters for me,
+I had to make two separate calls.
+
+Other printers on the LAN are visible to this instance of CUPS by default.
+We do not need this, let's disable this behavior:
+
+----
+sudo apt remove cups-browsed
+----
+
+Restart CUPS:
+
+----
+sudo /etc/init.d/cups restart
+----
+
+=== Install Canon CAPT Drivers
+
+IMPORTANT: For proper operation, it is essential that directory `/var/captmon` exists:
+
+----
+sudo mkdir /var/captmon
+----
+
+CAPT drivers depend on several other packages, which we need to install in advance:
+
+----
+sudo apt-get install libatk1.0-0  libgdk-pixbuf2.0-0 libglib2.0-0  libgtk2.0-0  libusb-0.1-4  zlib1g libtiff4-dev libglade2-0 ghostscript-x gsfonts-other gsfonts-x11 libpango1.0-0
+----
+
+Install Canon CAPT drivers:
+
+----
+sudo dpkg -i cndrvcups-common_3.20-1_i386.deb
+sudo dpkg -i cndrvcups-capt_2.70-1_i386.deb
+----
+
+=== Configure Printer
+
+----
+sudo /usr/sbin/lpadmin -p LBP2900 -m CNCUPSLBP2900CAPTK.ppd -v ccp://localhost:59687
+sudo /usr/sbin/lpadmin -p LBP2900 -E
+sudo /usr/sbin/ccpdadmin -p LBP2900 -o /dev/lp/canon_printer
+----
+
+----
+sudo update-rc.d ccpd defaults <1>
+sudo /etc/init.d/ccpd start
+----
+<1> Automatically start `ccpd` when the container is started.
+ 
+
+Test printer from inside the virtual container:
+
+----
+echo "Print this" | lp -d LBP2900
+----
+
+Make sure that the printer is working before continuing.
+
+
+We can now enter `exit` to leave our container.
+
+We should now be able to print something from other hosts, e.g. 
+the server hosting our container.
+
+
+=== Printing from Linux Hosts
+
+Execute the following command on the linux host, specifying remote printer
+name, host and port 
+
+----
+echo "Printing from the host!" | lp -d LBP2900 -h canon:631
+----
+
+If we want to be able to print to the printer by simply using
+`lp`, CUPS server needs to be installed.
+
+----
+sudo apt install cups
+----
+
+Create a local printer queue named `LBP2900`, which is forwarding requests 
+to `LBP2900` on `canon`:
+
+----
+sudo lpadmin -p LBP2900 -E -v http://canon:631/printers/LBP2900  -L canon
+----
+
+Finally, set this local printer as the default system printer:
+
+----
+sudo lpadmin -d LBP2900
+----
+
+Now we can simply use `lp` without explicitly specifying the remote printer.
+
+=== Printing from Windows 10
+
+To print remotely to the CANON printer from Windows 10, we need to install a generic 
+Postscript printer driver on Windows, which is compatible with CUPS on 'canon'.
+
+This is actually pretty easy, but proved to be surprisingly difficult to figure out. 
+I tried several drivers for other postscript printers, but none of them worked. 
+In particular, the Microsoft `Microsoft PS Class Driver` did not work at all.
+
+IMPORTANT: When you add the printer from the printer setup dialog, Windows will search for printers 
+and should find your printer. However, *do not click on the listed printer!* 
+
+Make sure to always select the link `The printer I want isn't listed`. Choose `Select a shared printer by name` and enter
+
+----
+http://canon:631/printers/LBP2900
+----
+
+into the input field and click `Next`.
+
+In the `Add Printer Wizard` dialog, select `Generic` as manufacturer and `35PPM PS` as printer. 
+
+After the installation is complete, you may want to open printer properties and disable/change
+several settings to better match your actual printer. For example, disable duplex mode, disable color mode, etc.
+
+
+== Conclusion
+
+For me, the method described above was the only way to get this printer working 
+and save it from the landfill. I would prefer to get https://github.com/agalakhov/captdriver.git working
+on a Raspberry PI, but there are issues with current versions of CUPS, unfortunately.
+
+
+
+
+
+
+
+
+
+
